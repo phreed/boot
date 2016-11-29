@@ -25,9 +25,14 @@
     :assoc-fn #(let [[p v] (string/split %3 #":" 2)]
                  (update-in %1 [%2] (fnil conj [])
                             (pod/canonical-coord [(read-string p) (or v "RELEASE")])))]
+   ["-E" "--exclusions SYM"      "Add the SYM dependency to the set of global exclusions."
+    :assoc-fn #(update-in %1 [%2] (fnil conj #{}) (symbol %3))]
    ["-e" "--set-env KEY=VAL"     "Add KEY => VAL to project env map."
     :assoc-fn #(let [[k v] (string/split %3 #"=" 2)]
                  (update-in %1 [%2] (fnil assoc {}) (keyword k) v))]
+   ["-i" "--init EXPR"           "Evaluate EXPR in the boot.user context."
+    :assoc-fn #(update-in %1 [%2] (fnil conj []) (read-string %3))]
+   ["-f" "--file PATH"           "Evaluate PATH (implies -BP). Args and options passed to -main."]
    ["-h" "--help"                "Print basic usage and help info."]
    ["-o" "--offline"             "Don't attempt to access remote repositories." :id :offline?]
    ["-P" "--no-profile"          "Skip loading of profile.boot script."]
@@ -36,13 +41,12 @@
    ["-q" "--quiet"               "Suppress output from boot itself."]
    ["-s" "--source-paths PATH"   "Add PATH to set of source directories."
     :assoc-fn #(update-in %1 [%2] (fnil conj #{}) %3)]
-   ["-t" "--target-path PATH"    "Set the target directory to PATH."]
-   ["-T" "--no-target"           "This option is ignored."]
    ["-u" "--update"              "Update boot to latest release version."]
    ["-U" "--update-snapshot"     "Update boot to latest snapshot version."]
    ["-v" "--verbose"             "More error info (-vv more verbose, etc.)"
     :assoc-fn (fn [x y _] (update-in x [y] (fnil inc 0)))]
-   ["-V" "--version"             "Print boot version info."]])
+   ["-V" "--version"             "Print boot version info."]
+   ["-x" "--exclude-clojure"     "Add org.clojure/clojure to the set of global exclusions."]])
 
 (defn- dep-ns-decls
   [jar]
@@ -76,12 +80,13 @@
     forms
     [`(comment ~(format "end %s" tag))]))
 
-(defn emit [boot? argv userscript localscript bootscript import-ns]
+(defn emit [boot? argv userscript localscript bootscript import-ns inits]
   (let [boot-use '[boot.core boot.util boot.task.built-in]]
     `(~(list 'ns 'boot.user
          (list* :use (concat boot-use import-ns)))
       ~@(when userscript (with-comments "global profile" userscript))
       ~@(when localscript (with-comments "local profile" localscript))
+      ~@(when (seq inits) (with-comments "--init exprs" inits))
       ~@(with-comments "boot script" bootscript)
       (let [boot?# ~boot?]
         (if-not boot?#
@@ -131,7 +136,12 @@
                             :else            [nil args*])
         boot?             (contains? #{nil bootscript} arg0)
         [errs opts args]  (if-not boot? [nil {} args] (parse-cli-opts args))
-        arg0              (if (:no-boot-script opts) nil arg0)
+        opts              (if-let [x (:exclude-clojure opts)]
+                            (-> (dissoc opts :exclude-clojure)
+                                (update-in [:exclusions] (fnil conj #{}) 'org.clojure/clojure))
+                            opts)
+        arg0              (or (:file opts) (if (:no-boot-script opts) nil arg0))
+        boot?             (and boot? (not (:file opts)))
         verbosity         (if (:quiet opts)
                             (* -1 @util/*verbosity*)
                             (or (:verbose opts) 0))]
@@ -173,11 +183,11 @@
               localforms  (when profile?
                             (some->> localscript slurp util/read-string-all))
               initial-env (->> [:source-paths :resource-paths :asset-paths
-                                :target-path :dependencies :checkouts :offline?]
+                                :dependencies :exclusions :checkouts :offline?]
                                (reduce #(if-let [v (opts %2)] (assoc %1 %2 v) %1) {})
                                (merge {} (:set-env opts)))
               import-ns   (export-task-namespaces initial-env)
-              scriptforms (emit boot? args userforms localforms bootforms import-ns)
+              scriptforms (emit boot? args userforms localforms bootforms import-ns (:init opts))
               scriptstr   (binding [*print-meta* true]
                             (str (string/join "\n\n" (map pr-boot-form scriptforms)) "\n"))]
 

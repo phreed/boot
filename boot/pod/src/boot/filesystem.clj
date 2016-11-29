@@ -22,11 +22,21 @@
 
 (def continue     FileVisitResult/CONTINUE)
 (def skip-subtree FileVisitResult/SKIP_SUBTREE)
-(def link-opts    (into-array LinkOption []))
-(def tmp-attrs    (into-array FileAttribute []))
-(def copy-opts    (into-array StandardCopyOption [StandardCopyOption/REPLACE_EXISTING]))
-(def open-opts    (into-array StandardOpenOption [StandardOpenOption/CREATE]))
-(def read-only    (PosixFilePermissions/fromString "r--r--r--"))
+
+(def ^"[Ljava.nio.file.LinkOption;" link-opts
+  (into-array LinkOption []))
+
+(def ^"[Ljava.nio.file.attribute.FileAttribute;" tmp-attrs
+  (into-array FileAttribute []))
+
+(def ^"[Ljava.nio.file.StandardCopyOption;" copy-opts
+  (into-array StandardCopyOption [StandardCopyOption/REPLACE_EXISTING]))
+
+(def ^"[Ljava.nio.file.StandardOpenOption;" open-opts
+  (into-array StandardOpenOption [StandardOpenOption/CREATE]))
+
+(def read-only
+  (PosixFilePermissions/fromString "r--r--r--"))
 
 (defprotocol IToPath
   (->path [x] "Returns a java.nio.file.Path for x."))
@@ -61,8 +71,9 @@
 (defn mkjarfs
   [^File jarfile & {:keys [create]}]
   (when create (io/make-parents jarfile))
-  (let [jaruri (->> jarfile .getCanonicalFile .toURI (str "jar:") URI/create)]
-    (FileSystems/newFileSystem jaruri {"create" (str (boolean create))})))
+  (let [jaruri (->> jarfile .getCanonicalFile .toURI (str "jar:") URI/create)
+        ^java.util.Map opts {"create" (str (boolean create))}]
+    (FileSystems/newFileSystem jaruri opts)))
 
 (defn mkignores
   [ignores]
@@ -97,7 +108,7 @@
    (FileSystemTree.
      root
      @(with-let [tree (atom {})]
-        (Files/walkFileTree root (mkvisitor root tree :ignore ignore))))))
+        (file/walk-file-tree root (mkvisitor root tree :ignore ignore))))))
 
 (defn merge-trees
   [{tree1 :tree} {tree2 :tree}]
@@ -147,28 +158,34 @@
   [^Path dest path ^Path src time]
   (let [dst (doto (rel dest path) mkparents!)]
     (util/dbug* "Filesystem: copying %s...\n" (string/join "/" path))
-    (Files/copy ^Path src ^Path dst copy-opts)
-    (Files/setLastModifiedTime dst (FileTime/fromMillis time))))
+    (try (Files/copy ^Path src ^Path dst copy-opts)
+         (Files/setLastModifiedTime dst (FileTime/fromMillis time))
+         (catch java.nio.file.NoSuchFileException ex
+           (util/dbug* "Filesystem: %s\n", (str ex))))))
 
 (defn link!
   [dest path src]
   (let [dst (rel dest path)]
     (util/dbug* "Filesystem: linking %s...\n" (string/join "/" path))
-    (Files/deleteIfExists dst)
-    (Files/createLink (doto dst mkparents!) src)))
+    (try (Files/deleteIfExists dst)
+         (Files/createLink (doto dst mkparents!) src)
+         (catch java.nio.file.NoSuchFileException ex
+           (util/dbug* "Filesystem: %s\n" (str ex))))))
 
 (defn delete!
   [dest path]
   (util/dbug* "Filesystem: deleting %s...\n" (string/join "/" path))
-  (Files/delete (rel dest path)))
+  (try (Files/delete (rel dest path))
+       (catch java.nio.file.NoSuchFileException ex
+         (util/dbug* "Filesystem: %s\n" (str ex)))))
 
 (defn write!
-  [dest writer path]
+  [dest writer-fn path]
   (let [dst (rel dest path)]
     (mkparents! dst)
     (with-open [os (Files/newOutputStream dst open-opts)]
       (util/dbug* "Filesystem: writing %s...\n" (string/join "/" path))
-      (.write writer os))))
+      (writer-fn os))))
 
 (defn patch!
   [dest before after & {:keys [link]}]

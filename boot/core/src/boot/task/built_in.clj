@@ -73,7 +73,7 @@
                    (string/join "\n"))))))
 
 (core/deftask ^{:deprecated "2.6.0"} checkout
-  "Checkout dependencies task. DEPRECATED.
+  "Checkout dependencies task. DEPRECATED. (Use -c, --checkouts Boot option.)
 
   This task facilitates working on a project and its dependencies at the same
   time, by extracting the dependency jar contents into the fileset. Transitive
@@ -128,8 +128,8 @@
             (pod/unpack-jar (.getPath file) tmp)))
         (->> tmps vals (reduce adder fs) core/commit!)))))
 
-(core/deftask speak
-  "Audible notifications during build.
+(core/deftask ^{:deprecated "2.7.0"} speak
+  "Audible notifications during build. DEPRECATED. Use the notify task.
 
   Default themes: system (the default), ordinance, pillsbury, and
   woodblock. New themes can be included via jar dependency with the
@@ -282,6 +282,74 @@
                         pedantic              (pedantic/prn-conflicts pod-env)
                         :else                 @usage))))))))
 
+(defn- relativize
+  [local-repo path]
+  (.getPath
+    (if-not local-repo
+      (io/file path)
+      (let [canonical-local-repo (.getCanonicalFile (io/file local-repo))]
+        (io/file local-repo (file/relative-to canonical-local-repo path))))))
+
+(defn- dep-conflicts
+  [{:keys [dependencies] :as env}]
+  (let [non-transitive? (set (map first dependencies))]
+    (into {} (->> (pedantic/dep-conflicts env)
+                  (remove (comp non-transitive? first))))))
+
+(core/deftask with-cp
+  "Specify Boot's classpath in a file instead of as Maven coordinates.
+
+  The --file option is required -- this specifies the PATH of the file that
+  will contain the JAR paths as a string suitable for passing to java -cp. Use
+  the minus sign, like --file -, to indicate stdin, stdout.
+
+  The default behavior if the --write flag is not specified is to read the
+  file specified with --file and load all the JARs onto the classpath. If the
+  --write flag is given the --dependencies (or the default depenedncies from
+  the boot env, e.g. (get-env :dependencies), if --dependencies isn't provided)
+  are resolved and the resulting list of JAR paths are written to the file in
+  a format suitable for passing to java -cp.
+
+  The --safe flag configures the task to throw an exception when writing the
+  classpath file if there are any unresolved dependency conflicts. These
+  conflicts can be resolved by adding :exclusions and by overriding transitive
+  dependencies with direct dependencies.
+
+  The --local-repo option specifies the PATH where the dependency JARs are
+  stashed. The default if this option is not given is to use the Maven local
+  repository setting from the boot environment. This option only applies in
+  combination with the --write option.
+
+  The --scopes option can be used to specify which dependency scopes to include
+  in the classpath file. The default scopes are compile, runtime, and provided."
+
+  [s safe               bool    "Throw an exception if there are unresolved dependency conflicts."
+   w write              bool    "Resolve dependencies and write the classpath file."
+   d dependencies EDN   edn     "The (optional) Maven dependencies to resolve and write to the classpath file."
+   e exclusions SYM     [sym]   "The vector of Maven group/artifact ids to globally exclude."
+   f file PATH          str     "The file containing JARs in java -cp format."
+   l local-repo PATH    str     "The (optional) project directory in which to stash resolved JARs."
+   S scopes SCOPE       #{str}  "The set of dependency scopes to include (default compile, runtime, provided)."]
+
+  (core/with-pass-thru [_]
+    (let [scopes    (or scopes #{"compile" "runtime" "provided"})
+          file-in   (if (= file "-") (System/in) file)
+          file-out  (if (= file "-") (System/out) file)
+          include?  #(scopes (:scope (util/dep-as-map %)))
+          env-opts  (select-keys *opts* [:local-repo :exclusions :dependencies])
+          exclude   (partial pod/apply-global-exclusions exclusions)]
+      (assert file "Expected --file option.")
+      (if-not write
+        (doseq [path (string/split (slurp file-in) #":")]
+          (pod/add-classpath path))
+        (let [env  (-> (merge-with #(or %2 %1) pod/env env-opts)
+                       (update-in [:dependencies] #(exclude (filter include? %))))]
+          (if-let [conflicts (and safe (not-empty (dep-conflicts env)))]
+            (throw (ex-info "Unresolved dependency conflicts." {:conflicts conflicts}))
+            (let [resolved        (pod/resolve-dependency-jars env)
+                  relative-paths  (map (partial relativize local-repo) resolved)]
+              (spit file-out (apply str (interpose ":" relative-paths))))))))))
+
 (core/deftask wait
   "Wait before calling the next handler.
 
@@ -305,15 +373,15 @@
       (sync! fs :link (not no-link)))))
 
 (core/deftask watch
-  "Call the next handler when source files change.
+  "Call the next handler when source files change."
 
-  Debouncing time is 10ms by default."
+  [q quiet          bool     "Suppress all output from running jobs."
+   v verbose        bool     "Print which files have changed."
+   M manual         bool     "Use a manual trigger instead of a file watcher."
+   d debounce MS    int      "Debounce time (how long to wait for filesystem events) in milliseconds."
+   i include REGEX  #{regex} "The set of regexes the paths of changed files must match for watch to fire."
+   e exclude REGEX  #{regex} "The set of regexes the paths of changed files must not match for watch to fire."]
 
-  [q quiet         bool "Suppress all output from running jobs."
-   v verbose       bool "Print which files have changed."
-   M manual        bool "Use a manual trigger instead of a file watcher."]
-
-  (pod/require-in pod/worker-pod "boot.watcher")
   (fn [next-task]
     (fn [fileset]
       (let [q            (LinkedBlockingQueue.)
@@ -323,7 +391,10 @@
                               (into (core/user-dirs fileset))
                               (map (memfn getPath)))
             watcher      (apply file/watcher! :time srcdirs)
-            debounce     (core/get-env :watcher-debounce)
+            incl-excl    (if-not (or (seq include) (seq exclude))
+                           identity
+                           (let [f (partial file/keep-filters? include exclude)]
+                             (partial filter (comp f io/file second))))
             watch-target (if manual core/new-build-at core/last-file-change)]
         (.offer q (System/currentTimeMillis))
         (add-watch watch-target k #(.offer q %4))
@@ -335,7 +406,7 @@
               (recur (conj ret more))
               (let [start        (System/currentTimeMillis)
                     etime        #(- (System/currentTimeMillis) start)
-                    changed      (watcher)
+                    changed      (when-not manual (incl-excl (watcher)))
                     should-fire? (or manual (not (empty? changed)))]
                 (when should-fire?
                   (when verbose
@@ -367,6 +438,7 @@
 
   [s server         bool  "Start REPL server only."
    c client         bool  "Start REPL client only."
+   C no-color       bool  "Disable colored REPL client output."
    e eval EXPR      edn   "The form the client will evaluate in the boot.user ns."
    b bind ADDR      str   "The address server listens on."
    H host HOST      str   "The host client connects to."
@@ -386,7 +458,7 @@
                      (assoc :standalone true
                             :custom-eval eval
                             :custom-init init
-                            :color @util/*colorize?*
+                            :color (and @util/*colorize?* (not no-color))
                             :skip-default-init skip-init))
         deps     (remove pod/dependency-loaded? @repl/*default-dependencies*)
         repl-svr (delay (apply core/launch-nrepl (mapcat identity srv-opts)))
@@ -424,7 +496,8 @@
                :packaging (or packaging "jar"))]
     (when-not (and project version)
       (throw (Exception. "need project and version to create pom.xml")))
-    (let [[gid aid] (util/extract-ids project)
+    (let [[project version] (pod/canonical-coord [project version])
+          [gid aid] (util/extract-ids project)
           pomdir    (io/file tgt "META-INF" "maven" gid aid)
           xmlfile   (io/file pomdir "pom.xml")
           propfile  (io/file pomdir "pom.properties")]
@@ -432,7 +505,7 @@
         (boot.pom/spit-pom! ~(.getPath xmlfile) ~(.getPath propfile) ~opts))
       (core/with-pre-wrap [fs]
         (util/info "Writing %s and %s...\n" (.getName xmlfile) (.getName propfile))
-        (-> fs (core/add-resource tgt) core/commit!)))))
+        (-> fs (core/add-resource tgt :meta {:project project}) core/commit!)))))
 
 (core/deftask sift
   "Transform the fileset, matching paths against regexes.
@@ -704,21 +777,31 @@
           (when @throw? (throw (Exception. "java compiler error")))))
       (-> fs (core/add-resource tgt) core/commit!))))
 
+(defn- sift-poms
+  [fileset project]
+  (let [poms      (->> (core/output-files fileset)
+                       (core/by-name ["pom.xml"]))
+        prj-match (when project
+                    (str "/" (pod/full-id project) "/pom.xml"))
+        project?  #(if-not prj-match
+                     (:project %)
+                     (.endsWith (core/tmp-path %) prj-match))]
+    (if (< (count poms) 2) poms (->> poms (filter project?)))))
+
 (core/deftask jar
   "Build a jar file for the project."
 
   [f file PATH        str       "The target jar file name."
    M manifest KEY=VAL {str str} "The jar manifest map."
-   m main MAIN        sym       "The namespace containing the -main function."]
+   m main MAIN        sym       "The namespace containing the -main function."
+   p project SYM      sym       "The project symbol -- used to find the correct pom.xml file."]
 
   (let [old-fs (atom nil)
         tgt    (core/tmp-dir!)
         out    (atom nil)]
     (core/with-pre-wrap [fs]
       (let [new-fs    (core/output-fileset fs)
-            [pom & p] (->> (core/output-files fs)
-                           (core/by-name ["pom.xml"])
-                           (map core/tmp-file))
+            [pom & p] (map core/tmp-file (sift-poms fs project))
             {:keys [project version]}
             (when (and pom (not (seq p)))
               (pod/with-call-worker
@@ -727,6 +810,8 @@
                       (str (name project) "-" version ".jar"))
             fname   (or file pomname "project.jar")
             out*    (io/file tgt fname)]
+        (when (and project (seq p))
+          (util/warn "Multiple pom.xml files for project: %s\n" project))
         (when (not= @out out*)
           (when (and @out (.exists @out))
             (file/move @out out*))

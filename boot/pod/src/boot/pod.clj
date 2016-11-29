@@ -385,7 +385,7 @@
 (defmacro with-call-in
   "Given a pod and an expr of the form (f & args), resolves f in the pod,
   applies it to args, and returns the result to the caller. The expr may be a
-  template containing the ~ (unqupte) and ~@ (unquote-splicing) reader macros.
+  template containing the ~ (unquote) and ~@ (unquote-splicing) reader macros.
   These will be evaluated in the calling scope and substituted in the template
   like the ` (syntax-quote) reader macro.
 
@@ -427,7 +427,7 @@
 
   Unlike call-in*, expr can be any expression, without the restriction that it
   be of the form (f & args).
-  
+
   Note: Since forms must be serialized to pass from one pod to another it is
   not always appropriate to include metadata, as metadata may contain eg. File
   objects which are not printable/readable by Clojure."
@@ -441,24 +441,25 @@
        (util/guard (read-string ret)))))
 
 (defmacro with-eval-in
-  "Given a pod and an expr, evaluates expr in the pod and returns the result
-  to the caller. The expr may be a template containing the ~ (unqupte) and
-  ~@ (unquote-splicing) reader macros. These will be evaluated in the calling
-  scope and substituted in the template like the ` (syntax-quote) reader macro.
+  "Given a pod and an expr, evaluates the body in the pod and returns the
+  result to the caller. The body may be a template containing the ~ (unquote)
+  and ~@ (unquote-splicing) reader macros. These will be evaluated in the
+  calling scope and substituted in the template like the ` (syntax-quote)
+  reader macro.
 
   Note: Unlike syntax-quote, no name resolution is done on the template
   forms.
 
-  Note2: The macro returned value will be nil unless it is
-  printable/readable. For instance, returning File objects will not work
-  as they are not printable/readable by Clojure."
+  Note2: The macro returned value will be nil unless it is printable/readable.
+  For instance, returning File objects will not work as they are not printable
+  and readable by Clojure."
   [pod & body]
   `(if-not ~pod
      (eval (bt/template (do ~@body)))
      (eval-in* ~pod (bt/template (do ~@body)))))
 
 (defmacro with-eval-worker
-  "Like with-eval-in, evaluating expr in the worker pod."
+  "Like with-eval-in, evaluates the body in the worker pod."
   [& body]
   `(with-eval-in worker-pod ~@body))
 
@@ -470,33 +471,71 @@
       (require '~(symbol (str ns))))))
 
 (defn eval-in-callee
+  "Implementation detail. This is the callee side of the boot.pod/with-pod
+  mechanism (i.e. this is the function that's called in the pod to perform
+  the work)."
   [caller-pod callee-pod expr]
   (eval (xf/->clj caller-pod callee-pod expr :for-eval true)))
 
 (defn eval-in-caller
+  "Implementation detail. This is the caller side of the boot.pod/with-pod
+  mechanism (i.e. this is the function that's called in the caller pod to
+  send work to the callee pod so the callee pod can perform the work)."
   [caller-pod callee-pod expr]
   (xf/->clj callee-pod caller-pod
             (with-invoke-in (.get callee-pod)
               (boot.pod/eval-in-callee caller-pod callee-pod expr))))
 
 (defmacro with-pod
+  "Like boot.pod/with-eval-in but with the ability to pass most types between
+  the caller and the pod.
+
+  Supports the normal types that are recognized by the Clojure reader, plus
+  functions, records, and all Java types. (The namespace in which the record
+  type is defined must be on the classpath in the pod.)"
   [pod & body]
   `(if-not ~pod
      (eval (bt/template (do ~@body)))
      (eval-in-caller this-pod (WeakReference. ~pod) (bt/template (do ~@body)))))
 
 (defmacro with-worker
+  "Like with-pod, evaluates the body in the worker pod."
   [& body]
   `(with-pod worker-pod ~@body))
 
+(defn canonical-id
+  "Given a project id symbol, returns the canonical form, with the group id
+  as the namespace of the resulting symbol only if it's not the same as the
+  artifact id.
+
+  Examples: (canonical-id 'foo) ;=> 'foo
+            (canonical-id 'foo/foo) ;=> 'foo
+            (canonical-id 'foo/bar) ;=> 'foo/bar"
+  [id]
+  (when id
+    (let [[ns nm] ((juxt namespace name) id)]
+      (if (not= ns nm) (symbol id) (symbol nm)))))
+
+(defn full-id
+  "Given a project id symbol, returns the fully qualified form, with the group
+  id as the namespace of the resulting symbol and the artifact id as the name.
+
+  For example: (full-id 'foo)     ;=> foo/foo
+               (full-id 'foo/bar) ;=> foo/bar"
+  [id]
+  (when id
+    (let [[ns nm] ((juxt namespace name) id)]
+      (symbol (or ns nm) nm))))
+
 (defn canonical-coord
   "Given a dependency coordinate of the form [id version ...], returns the
-  canonical form, i.e. the id symbol is always fully qualified.
-  
-  For example: (canonical-coord '[foo \"1.2.3\"]) ;=> [foo/foo \"1.2.3\"]"
+  canonical form, i.e. the id symbol is not fully qualified when the artifact
+  and group ids are the same.
+
+  For example: (canonical-coord '[foo/foo \"1.2.3\"]) ;=> [foo \"1.2.3\"]
+               (canonical-coord '[foo/bar \"1.2.3\"]) ;=> [foo/bar \"1.2.3\"]"
   [[id & more :as coord]]
-  (let [[ns nm] ((juxt namespace name) id)]
-    (assoc-in (vec coord) [0] (if (not= ns nm) id (symbol nm)))))
+  (assoc-in (vec coord) [0] (canonical-id id)))
 
 (defn resolve-dependencies
   "Returns a seq of maps of the form {:jar <path> :dep <dependency vector>}
@@ -804,9 +843,17 @@
 
 (defn make-pod
   "Returns a newly constructed pod. A boot environment configuration map, env,
-  may be given to initialize the pod with dependencies, directories, etc."
+  may be given to initialize the pod with dependencies, directories, etc.
+
+  The :name option sets the name of the pod. Default uses the namespace of
+  the caller as the pod's name.
+
+  The :data option sets the boot.pod/data object in the pod. The data object
+  is used to coordinate different pods, for example the data object could be
+  a BlockingQueue or ConcurrentHashMap shared with other pods. Default uses
+  boot.pod/data from the current pod."
   ([] (init-pod! env (boot.App/newPod nil data)))
-  ([{:keys [directories dependencies] :as env}]
+  ([{:keys [directories dependencies] :as env} & {:keys [name data]}]
      (let [dirs (map io/file directories)
            cljname (or (boot.App/getClojureName) "org.clojure/clojure")
            dfl  [['boot/pod (boot.App/getBootVersion)]
@@ -815,9 +862,28 @@
            jars (resolve-dependency-jars env)
            urls (concat dirs jars)]
        (doto (->> (into-array java.io.File urls)
-                  (boot.App/newShim nil data)
+                  (boot.App/newShim nil (or data boot.pod/data))
                   (init-pod! env))
-         (pod-name (caller-namespace))))))
+         (pod-name (or name (caller-namespace)))))))
+
+(defn make-pod-cp
+  "Returns a new pod with the given classpath. Classpath may be a collection
+  of java.lang.String or java.io.File objects.
+
+  The :name and :data options are the same as for boot.pod/make-pod.
+
+  NB: The classpath must include Clojure (either clojure.jar or directories),
+  but must not include Boot's pod.jar, Shimdandy's impl, or Dynapath. These
+  are needed to bootstrap the pod, have no transitive dependencies, and are
+  added automatically."
+  [classpath & {:keys [name data]}]
+  (doto (->> (assoc env :dependencies [['boot/pod (boot.App/getBootVersion)]])
+             (resolve-dependency-jars)
+             (into (map io/file classpath))
+             (into-array java.io.File)
+             (boot.App/newShim nil (or data boot.pod/data))
+             (init-pod! nil))
+    (pod-name (or name (caller-namespace)))))
 
 (defn destroy-pod
   "Closes open resources held by the pod, making the pod eligible for GC."
@@ -830,7 +896,7 @@
   "Creates a pod pool service. The service maintains a pool of prebuilt pods
   with a current active pod and a number of pods in reserve, warmed and ready
   to go (it takes ~2s to load clojure.core into a pod).
-  
+
   Pool Service API:
   -----------------
 

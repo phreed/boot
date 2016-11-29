@@ -21,7 +21,7 @@
   (:import
     [boot App]
     [java.io File]
-    [java.nio.file Path]
+    [java.nio.file Path Paths]
     [java.net URLClassLoader URL]
     [java.lang.management ManagementFactory]
     [java.util.concurrent LinkedBlockingQueue TimeUnit Semaphore ExecutionException]))
@@ -158,24 +158,28 @@
   are not reliable within a pod environment for this reason."
 
   []
-  (let [user-dirs       (->> (get-env)
-                             ((juxt :source-paths :resource-paths))
-                             (apply concat)
-                             (map #(.getAbsolutePath (io/file %))))
-        paths           (->> (pod/get-classpath) (map #(.getPath (URL. %))))
-        dir?            (comp (memfn isDirectory) io/file)
-        fake-paths      (->> paths (remove dir?) (concat user-dirs))
-        separated       (partial string/join (System/getProperty "path.separator"))
-        boot-class-path (separated paths)
-        fake-class-path (separated fake-paths)]
+  (.start
+    (Thread.
+      (bound-fn []
+        (let [user-dirs       (->> (get-env)
+                                   ((juxt :source-paths :resource-paths))
+                                   (apply concat)
+                                   (map #(.getAbsolutePath (io/file %))))
+              paths           (->> (pod/get-classpath)
+                                   (map #(.getPath (.toFile (Paths/get (.toURI (URL. %)))))))
+              dir?            (comp (memfn isDirectory) io/file)
+              fake-paths      (->> paths (remove dir?) (concat user-dirs))
+              separated       (partial string/join (System/getProperty "path.separator"))
+              boot-class-path (separated paths)
+              fake-class-path (separated fake-paths)]
 
-    (when (or (not= boot-class-path (get-env :boot-class-path))
-              (not= fake-class-path (get-env :fake-class-path)))
-      (set-env! :fake-class-path fake-class-path
-                :boot-class-path boot-class-path))
-    ;; Kept for backwards compatibility
-    (System/setProperty "boot.class.path" boot-class-path)
-    (System/setProperty "fake.class.path" fake-class-path)))
+          (when (or (not= boot-class-path (get-env :boot-class-path))
+                    (not= fake-class-path (get-env :fake-class-path)))
+            (set-env! :fake-class-path fake-class-path
+                      :boot-class-path boot-class-path))
+          ;; Kept for backwards compatibility
+          (System/setProperty "boot.class.path" boot-class-path)
+          (System/setProperty "fake.class.path" fake-class-path))))))
 
 (defn- set-user-dirs!
   "Resets the file watchers that sync the project directories to their
@@ -214,26 +218,34 @@
   (#'clojure.core/load-data-readers)
   (set! *data-readers* (.getRawRoot #'*data-readers*)))
 
+(defn- map-of-deps
+  "build a map of dependency sym to version, including transitive deps."
+  [env deps]
+  (->> (assoc env :dependencies deps)
+       pod/resolve-dependencies
+       (map (juxt (comp first :dep) (comp second :dep)))
+       (into {})))
+
 (defn- find-version-conflicts
   "compute a seq of [name new-coord old-coord] elements describing version conflicts
   when resolving the 'old' dependency vector and the 'new' dependency vector"
   [old new env]
-  (let [resolve-deps #(->> (assoc env :dependencies %)
-                           pod/resolve-dependencies
-                           (map (juxt (comp first :dep) (comp second :dep)))
-                           (into {}))
-        old-deps (resolve-deps old)
-        new-deps (resolve-deps new)]
-    (->> new-deps
-         (map (fn [[name coord]] [name coord (get old-deps name coord)]))
-         (remove (fn [[name new-coord old-coord]] (= new-coord old-coord))))))
+  (let [clj-name (symbol (boot.App/getClojureName))
+        old-deps (-> (map-of-deps env old)
+                     (assoc clj-name (clojure-version)))]
+    (->> (map-of-deps env new) (keep (fn [[name coord]]
+                                       (let [c (old-deps name coord)]
+                                         (when (not= coord c) [name coord c])))))))
 
 (defn- report-version-conflicts
   "Warn, when the version of a dependency changes. Call this with the
   result of find-version-conflicts as arguments"
   [coll]
-  (doseq [[name new-coord old-coord] coll]
-    (util/warn "Warning: version conflict detected: %s version changes from %s to %s\n" name old-coord new-coord)))
+  (let [clj-name (symbol (boot.App/getClojureName))]
+    (doseq [[name new-coord old-coord] coll]
+      (let [op (if (= name clj-name) "NOT" "ALSO")]
+        (-> "Classpath conflict: %s version %s already loaded, %s loading version %s\n"
+            (util/warn name old-coord op new-coord))))))
 
 (defn- add-directories!
   "Add URLs (directories or jar files) to the classpath."
@@ -506,17 +518,28 @@
      [ #\".*\"                   first-wins-merger ]]
 
   The merge rule regular expressions are tested in order, and the fn
-  from the first match is applied."
-  [fileset ^File dir & {:keys [mergers include exclude] :as opts}]
+  from the first match is applied.
+
+  The :meta option can be used to provide a map of metadata which will be
+  merged into each TmpFile added to the fileset."
+  [fileset ^File dir & {:keys [mergers include exclude meta] :as opts}]
   (tmpd/add fileset (get-add-dir fileset #{:asset}) dir opts))
 
 (defn add-cached-asset
-  "FIXME: document"
-  [fileset cache-key cache-fn & {:keys [mergers include exclude] :as opts}]
+  "Like add-asset, but takes a cache-key (string) and cache-fn instead of
+  a directory. If the cache-key is not found in Boot's fileset cache then the
+  cache-fn is invoked with a single argument -- a directory in which to write
+  the files that Boot should add to the cache -- and the contents of this
+  directory are then added to the cache. In either case the cached files are
+  then added to the fileset.
+
+  The opts options are the same as those documented for boot.core/add-asset."
+  [fileset cache-key cache-fn & {:keys [mergers include exclude meta] :as opts}]
   (tmpd/add-cached fileset (get-add-dir fileset #{:asset}) cache-key cache-fn opts))
 
 (defn mv-asset
-  "FIXME: document"
+  "Given a collection of tmpfiles, moves them in the fileset such that they
+  become asset files."
   [fileset tmpfiles]
   (tmpd/add-tmp fileset (get-add-dir fileset #{:asset}) tmpfiles))
 
@@ -542,17 +565,28 @@
      [ #\".*\"                   first-wins-merger ]]
 
   The merge rule regular expressions are tested in order, and the fn
-  from the first match is applied."
-  [fileset ^File dir & {:keys [mergers include exclude] :as opts}]
+  from the first match is applied.
+
+  The :meta option can be used to provide a map of metadata which will be
+  merged into each TmpFile added to the fileset."
+  [fileset ^File dir & {:keys [mergers include exclude meta] :as opts}]
   (tmpd/add fileset (get-add-dir fileset #{:source}) dir opts))
 
 (defn add-cached-source
-  "FIXME: document"
-  [fileset cache-key cache-fn & {:keys [mergers include exclude] :as opts}]
+  "Like add-source, but takes a cache-key (string) and cache-fn instead of
+  a directory. If the cache-key is not found in Boot's fileset cache then the
+  cache-fn is invoked with a single argument -- a directory in which to write
+  the files that Boot should add to the cache -- and the contents of this
+  directory are then added to the cache. In either case the cached files are
+  then added to the fileset.
+
+  The opts options are the same as those documented for boot.core/add-source."
+  [fileset cache-key cache-fn & {:keys [mergers include exclude meta] :as opts}]
   (tmpd/add-cached fileset (get-add-dir fileset #{:source}) cache-key cache-fn opts))
 
 (defn mv-source
-  "FIXME: document"
+  "Given a collection of tmpfiles, moves them in the fileset such that they
+  become source files."
   [fileset tmpfiles]
   (tmpd/add-tmp fileset (get-add-dir fileset #{:source}) tmpfiles))
 
@@ -578,17 +612,28 @@
      [ #\".*\"                   first-wins-merger ]]
 
   The merge rule regular expressions are tested in order, and the fn
-  from the first match is applied."
-  [fileset ^File dir & {:keys [mergers include exclude] :as opts}]
+  from the first match is applied.
+
+  The :meta option can be used to provide a map of metadata which will be
+  merged into each TmpFile added to the fileset."
+  [fileset ^File dir & {:keys [mergers include exclude meta] :as opts}]
   (tmpd/add fileset (get-add-dir fileset #{:resource}) dir opts))
 
 (defn add-cached-resource
-  "FIXME: document"
-  [fileset cache-key cache-fn & {:keys [mergers include exclude] :as opts}]
+  "Like add-resource, but takes a cache-key (string) and cache-fn instead of
+  a directory. If the cache-key is not found in Boot's fileset cache then the
+  cache-fn is invoked with a single argument -- a directory in which to write
+  the files that Boot should add to the cache -- and the contents of this
+  directory are then added to the cache. In either case the cached files are
+  then added to the fileset.
+
+  The opts options are the same as those documented for boot.core/add-resource."
+  [fileset cache-key cache-fn & {:keys [mergers include exclude meta] :as opts}]
   (tmpd/add-cached fileset (get-add-dir fileset #{:resource}) cache-key cache-fn opts))
 
 (defn mv-resource
-  "FIXME: document"
+  "Given a collection of tmpfiles, moves them in the fileset such that they
+  become resource files."
   [fileset tmpfiles]
   (tmpd/add-tmp fileset (get-add-dir fileset #{:resource}) tmpfiles))
 
@@ -651,7 +696,26 @@
   (apply file/sync! :time dest srcs))
 
 (defn patch!
-  "Given prev-state "
+  "Given a dest and a sequence of srcs, all of which satisfying the IToPath
+  protocol, updates dest such that it contains the union of the contents of
+  srcs and returns an immutable value reflecting the final state of dest. The
+  String, java.io.File, java.nio.file.Path, and java.nio.file.FileSystem types
+  satisfy IToPath.
+
+  Paths in dest that are not in any of the srcs will be removed; paths in any
+  of the srcs that are not in dest or have different contents than the path
+  in dest will be copied (or hardlinked, see :link option below).
+
+  The :ignore option specifies a set of regex patterns for paths that will be
+  ignored.
+
+  The :state option specifies the initial state of dest (usually set to the
+  value returned by a previous call to this function). When provided, this
+  option makes the patching operation more efficient by eliminating the need
+  to scan dest to establish its current state.
+
+  The :link option specifies whether to create hardlinks instead of copying
+  files from srcs to dest."
   [dest srcs & {:keys [ignore state link]}]
   (let [dest    (fs/->path dest)
         before  (or state (fs/mktree dest))
@@ -706,7 +770,6 @@
              :resource-paths   #{}
              :checkout-paths   #{}
              :asset-paths      #{}
-             :target-path      "target"
              :exclusions       #{}
              :repositories     default-repos
              :mirrors          @default-mirrors})
@@ -851,7 +914,7 @@
            (let [msg# (delay (format "deftask %s/%s was overridden\n" *ns* '~sym))]
              (boot.util/warn (if (<= @util/*verbosity* 2)
                                @msg#
-                               (ex/format-exception (Exception. @msg#)))))))
+                               (ex/format-exception (Exception. ^String @msg#)))))))
        (cli2/defclifn ~(vary-meta sym assoc ::task true)
          ~@heads
          ~bindings
@@ -892,23 +955,41 @@
   []
   (reset! *warnings* 0))
 
+(defn- take-subargs [open close [x & xs :as coll]]
+  (if (not= x open)
+    [nil coll]
+    (loop [[x & xs] xs depth 1 ret []]
+      (if (not x)
+        [ret []]
+        (cond (= x open)  (recur xs (inc depth) (conj ret x))
+              (= x close) (if (zero? (dec depth))
+                            [ret xs]
+                            (recur xs (dec depth) (conj ret x)))
+              :else       (recur xs depth (conj ret x)))))))
+
 (defn- construct-tasks
   "Given command line arguments (strings), constructs a task pipeline by
   resolving the task vars, calling the task constructors with the arguments
   for that task, and composing them to form the pipeline."
-  [& argv]
-  (loop [ret [] [op-str & args] argv]
+  [argv & {:keys [in-order]}]
+  (loop [ret [] [op-str & args :as argv] argv]
     (if-not op-str
       (apply comp (filter fn? ret))
-      (let [op (-> op-str symbol resolve)]
-        (when-not (and op (:boot.core/task (meta op)))
-          (throw (IllegalArgumentException. (format "No such task (%s)" op-str))))
-        (let [spec   (:argspec (meta op))
-              parsed (cli/parse-opts args spec :in-order true)]
-          (when (seq (:errors parsed))
-            (throw (IllegalArgumentException. (string/join "\n" (:errors parsed)))))
-          (let [[opts argv] (#'cli2/separate-cli-opts args spec)]
-            (recur (conj ret (apply (var-get op) opts)) argv)))))))
+      (case op-str
+        "--" (recur ret args)
+        "["  (let [[argv remainder] (take-subargs "[" "]" argv)]
+               (recur (conj ret (construct-tasks argv :in-order false)) remainder))
+        (let [op (-> op-str symbol resolve)]
+          (when-not (and op (:boot.core/task (meta op)))
+            (throw (IllegalArgumentException. (format "No such task (%s)" op-str))))
+          (let [spec   (:argspec (meta op))
+                parsed (cli/parse-opts args spec :in-order in-order)]
+            (when (seq (:errors parsed))
+              (throw (IllegalArgumentException. (string/join "\n" (:errors parsed)))))
+            (let [[opts argv] (if-not in-order
+                                [args nil]
+                                (#'cli2/separate-cli-opts args spec))]
+              (recur (conj ret (apply (var-get op) opts)) argv))))))))
 
 (defn- fileset-syncer
   "Given a seq of directories dirs, returns a stateful function of one
@@ -946,7 +1027,7 @@
           (util/with-let [_ nil]
             (run-tasks
               (cond (every? fn? argv)     (apply comp argv)
-                    (every? string? argv) (apply construct-tasks argv)
+                    (every? string? argv) (construct-tasks argv :in-order true)
                     :else (throw (IllegalArgumentException.
                                    "Arguments must be either all strings or all fns"))))))
        (catch ExecutionException e

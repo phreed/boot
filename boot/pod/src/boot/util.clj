@@ -255,9 +255,8 @@
   [ex]
   (case @*verbosity*
     0 nil
-    1 (pretty/write-exception *err* ex
-        {:properties true :filter repl/standard-frame-filter})
-    2 (pretty/write-exception *err* ex {:properties true})
+    1 (pretty/write-exception *err* ex nil)
+    2 (pretty/write-exception *err* ex {:filter nil})
     (binding [*out* *err*] (.printStackTrace ex))))
 
 (defn print-tree
@@ -327,20 +326,22 @@
 
 (defn dep-as-map
   "Returns the given dependency vector as a map with :project and :version
-  keys plus any modifiers (eg. :scope, :exclusions, etc)."
-  [[project version & kvs]]
-  (let [d {:project project :version version}]
-    (merge {:scope "compile"}
-      (if-not (seq kvs) d (apply assoc d kvs)))))
+  keys plus any modifiers (eg. :scope, :exclusions, etc).  If the version
+  is not specified, nil will be used."
+  [[project & terms]]
+  (let [[version & kvs] (if (odd? (count terms)) terms (cons nil terms))
+        d {:project project :version version :scope "compile"}]
+    (if-not (seq kvs) d (apply assoc d kvs))))
 
 (defn map-as-dep
   "Returns the given dependency vector with :project and :version put at
-  index 0 and 1 respectively and modifiers (eg. :scope, :exclusions,
-  etc) next."
+  indexes 0 and 1 respectively (if the values are not nil) and modifiers
+  (e.g. :scope, :exclusions, etc.) and their values afterwards."
   [{:keys [project version] :as dep-map}]
   (let [kvs (remove #(or (some #{:project :version} %)
-                         (= [:scope "compile"] %)) dep-map)]
-    (vec (remove nil? (into [project version] (flatten kvs))))))
+                         (= [:scope "compile"] %)) dep-map)
+        d (vec (remove nil? [project version]))]
+    (vec (into d (mapcat identity kvs)))))
 
 (defn jarname
   "Generates a friendly name for the jar file associated with the given project
