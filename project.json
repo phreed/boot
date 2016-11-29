@@ -1,0 +1,28 @@
+{
+  "name": "boot",
+  "version": "1.0.0-*",
+  "description": "Build tooling for Clojure",
+  "copyright": "MIT",
+  "title": "Build tooling for Clojure on the CLR",
+  "entryPoint": "App.Main",
+  "authors": [
+    "Fred Eisele"
+  ],
+  "language": "en-us",
+  "buildOptions": {
+    "debugType": "portable",
+    "emitEntryPoint": true
+  },
+  "dependencies": {},
+  "frameworks": {
+    "netcoreapp1.1": {
+      "dependencies": {
+        "Microsoft.NETCore.App": {
+          "type": "platform",
+          "version": "1.1.0"
+        }
+      },
+      "imports": "dnxcore50"
+    }
+  }
+}

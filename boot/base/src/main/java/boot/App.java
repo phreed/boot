@@ -24,6 +24,8 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+
+// https://github.com/projectodd/shimdandy/
 import org.projectodd.shimdandy.ClojureRuntimeShim;
 
 @SuppressWarnings("unchecked")
@@ -84,7 +86,8 @@ public class App {
 
     public static boolean
     isWindows() throws Exception {
-        return (System.getProperty("os.name").toLowerCase().indexOf("win") >= 0); }
+        final string osName = System.getProperty("os.name");
+        return (osName.toLowerCase().indexOf("win") >= 0); }
 
     public static File
     mkFile(File parent, String... kids) throws Exception {
@@ -173,16 +176,12 @@ public class App {
     config() throws Exception {
         HashMap<String, String> ret = new HashMap<>();
 
-        ret.putAll(properties2map(mergeProperties()));
-        ret.remove("BOOT_HOME");
-        ret.putAll(System.getenv());
-        ret.putAll(properties2map(System.getProperties()));
-
-        Iterator<String> i = ret.keySet().iterator();
-        while (i.hasNext()) {
-            String k = i.next();
-            if (! k.startsWith("BOOT_")) i.remove(); }
-
+        PutAll(ret, properties2map(mergeProperties()));
+        PutAll(ret, System.getenv());
+        PutAll(ret, properties2map(System.getProperties()));
+        foreach (var item in ret.Where(item => !item.Value.StartsWith("BOOT_", StringComparison.Ordinal).ToList()) {
+            ret.Remove(item.Key);
+        }
         return ret; }
 
     public static String
@@ -398,8 +397,9 @@ public class App {
             core.get().require("boot.main");
             core.get().invoke("boot.main/-main", nextId(), worker.get(), hooks, args);
             return -1; }
+        catch (Exit t) {
+            return Integer.parseInt(t.getMessage());
         catch (Throwable t) {
-            if (t instanceof Exit) return Integer.parseInt(t.getMessage());
             System.out.println("Boot failed to start:");
             t.printStackTrace();
             return -2; }
